@@ -1,0 +1,118 @@
+#!/usr/bin/env node
+// Collect every finished benchmark run: the per-step times each job recorded
+// (its result.json artifact) and the job's own start and end from the GitHub
+// API, which is what billing rounds up to whole minutes.
+//
+//   node scripts/collect.mjs            # needs gh, logged in
+//
+// Writes results/<workload>.json and results/<workload>.csv, and prints a
+// summary per runner label.
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, readdirSync, writeFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+const REPO = process.env.BENCH_REPO ?? "The-DevOps-Daily/gha-runner-benchmark";
+
+// List price per minute for each runner label, USD, read 2026-10-10 and
+// checked again 2026-10-14.
+// GitHub: docs.github.com/en/billing/reference/actions-runner-pricing. Public
+// repos run these for free; the price is what a private repo would pay. The
+// 4-vCPU Ubuntu runner public repos get is priced as the 4-core larger runner.
+// Build Hub: bitrise.io/pricing, rate from the monthly plan budget.
+const PRICE_PER_MIN = {
+  "github-ubuntu-24.04": 0.012,
+  "github-linux-8-core": 0.022,
+  "github-macos-15": 0.062,
+  "github-macos-15-xlarge": 0.102,
+  "buildhub-linux-medium": 0.0125,
+  "buildhub-linux-large": 0.025,
+  "buildhub-m4-large": 0.03,
+  "buildhub-m4-xlarge": 0.06,
+  // Real app workloads. Enterprise machines (M4 Pro, Zen5) have contract
+  // prices, so their rows carry no list price.
+  "github-macos-26": 0.062,
+  "buildhub-ios-m4-large": 0.03,
+  "buildhub-ios-m4-xlarge": 0.06,
+  "buildhub-android-linux-xlarge": 0.05,
+};
+
+const gh = (...args) => execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+const median = (xs) => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s.length ? (s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2) : null;
+};
+
+// Results come from artifacts, so the workload name is checked before it is
+// used in a file path.
+const WORKLOADS = new Set([
+  "linux-prometheus",
+  "macos-xcodebenchmark",
+  "ios-wikipedia-unit-tests",
+  "android-thunderbird-build",
+  "android-thunderbird-test",
+]);
+const byWorkload = {};
+for (const workflow of ["bench-linux.yml", "bench-macos.yml", "bench-ios-app.yml", "bench-android-app.yml"]) {
+  const runs = JSON.parse(gh("run", "list", "-R", REPO, "--workflow", workflow, "--limit", "50", "--json", "databaseId,status,conclusion"));
+  for (const run of runs.filter((r) => r.status === "completed")) {
+    const jobs = JSON.parse(gh("api", `repos/${REPO}/actions/runs/${run.databaseId}/jobs?per_page=100`)).jobs;
+    const dir = mkdtempSync(join(tmpdir(), "bench-"));
+    try {
+      gh("run", "download", String(run.databaseId), "-R", REPO, "-D", dir);
+    } catch {
+      continue; // no artifacts (failed before upload)
+    }
+    for (const name of readdirSync(dir)) {
+      const file = join(dir, name, "result.json");
+      if (!existsSync(file)) continue;
+      const result = JSON.parse(readFileSync(file, "utf8"));
+      if (!WORKLOADS.has(result.workload)) continue;
+      const job = jobs.find((j) => /^(build|test|gradle) \(/.test(j.name) && j.name.endsWith(` (${result.run})`));
+      const seconds = job ? (Date.parse(job.completed_at) - Date.parse(job.started_at)) / 1000 : null;
+      // Time from queued to picked up by a runner. Not billed, but developers wait for it.
+      const queue = job ? (Date.parse(job.started_at) - Date.parse(job.created_at)) / 1000 : null;
+      (byWorkload[result.workload] ??= []).push({
+        ...result,
+        github_run: run.databaseId,
+        job_seconds: seconds,
+        queue_seconds: queue,
+        started_at: job?.started_at ?? null,
+        // GitHub rounds each job up to a whole minute. Build Hub has not published
+        // its rounding rule yet, so its rows use the same rule until it does.
+        billed_minutes: seconds === null ? null : Math.ceil(seconds / 60),
+        runner_name: job?.runner_name ?? null,
+      });
+    }
+  }
+}
+
+for (const [workload, rows] of Object.entries(byWorkload)) {
+  rows.sort((a, b) => a.label.localeCompare(b.label) || a.github_run - b.github_run || a.run - b.run);
+  writeFileSync(`results/${workload}.json`, `${JSON.stringify(rows, null, 2)}\n`);
+  const timeKeys = [...new Set(rows.flatMap((r) => Object.keys(r.times)))].sort();
+  const cols = ["label", "github_run", "run", "started_at", "queue_seconds", "job_seconds", "billed_minutes", "price_per_min", "cost_usd", "cpus", "model", ...timeKeys];
+  const cell = (v) => (v === null || v === undefined ? "" : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
+  const csv = rows.map((r) => {
+    const price = PRICE_PER_MIN[r.label] ?? null;
+    const cost = price !== null && r.billed_minutes !== null ? (r.billed_minutes * price).toFixed(4) : null;
+    return [r.label, r.github_run, r.run, r.started_at, r.queue_seconds, r.job_seconds, r.billed_minutes, price, cost, r.machine.cpus, r.machine.model, ...timeKeys.map((k) => r.times[k])]
+      .map(cell)
+      .join(",");
+  });
+  writeFileSync(`results/${workload}.csv`, `${cols.join(",")}\n${csv.join("\n")}\n`);
+  console.log(`\n${workload}`);
+  const labels = [...new Set(rows.map((r) => r.label))];
+  for (const label of labels) {
+    const rs = rows.filter((r) => r.label === label && !r.times.build_failed && !r.times.tests_failed && !r.times.task_failed);
+    const price = PRICE_PER_MIN[label];
+    const billed = median(rs.map((r) => r.billed_minutes));
+    console.log(
+      `  ${label.padEnd(24)} runs ${String(rs.length).padStart(2)}  build median ${median(rs.map((r) => r.times.build_s))?.toFixed(1)} s` +
+        (rs[0]?.times.test_s !== undefined ? `  test median ${median(rs.map((r) => r.times.test_s)).toFixed(1)} s` : "") +
+        `  job median ${median(rs.map((r) => r.job_seconds))?.toFixed(0)} s  billed ${billed} min` +
+        (price ? `  = $${(billed * price).toFixed(3)} a run at list price` : "") +
+        `  (${rs[0]?.machine.cpus} CPUs, ${rs[0]?.machine.model})`,
+    );
+  }
+}

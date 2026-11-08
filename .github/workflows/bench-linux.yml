@@ -1,0 +1,111 @@
+# Linux workload: build Prometheus and run its TSDB tests from a cold start.
+# Run it with a runner label (GitHub-hosted, or a Build Hub pool label later)
+# and a number of runs. Each run records the machine and the time of each step.
+name: bench-linux
+on:
+  # Two runs a day at different hours until 2026-10-24, because shared runners
+  # are noisier at busy times. The plan job skips scheduled runs after that.
+  schedule:
+    - cron: "17 4,16 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: How many runs
+        default: "5"
+      runner:
+        description: runs-on value as JSON, for example "ubuntu-24.04" or ["bitrise-runner-linux", "image:linux"]
+        default: '"ubuntu-24.04"'
+      label:
+        description: Name for this runner in the results
+        default: github-ubuntu-24.04
+
+env:
+  # v3.15.0, pinned by commit so a moved tag cannot change the workload.
+  PROMETHEUS_SHA: 5241a27fe3c6983549fccc32f6e65917408c63cd
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      runs: ${{ steps.n.outputs.runs }}
+      go: ${{ steps.n.outputs.go }}
+    steps:
+      - id: n
+        run: |
+          echo "runs=$(python3 -c "import json; print(json.dumps(list(range(1, int('${{ inputs.runs || '2' }}') + 1))))")" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = schedule ] && [ "$(date -u +%Y%m%d)" -ge 20261024 ]; then echo go=false; else echo go=true; fi >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.go == 'true'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        run: ${{ fromJSON(needs.plan.outputs.runs) }}
+    runs-on: ${{ fromJSON(inputs.runner || '"ubuntu-24.04"') }}
+    steps:
+      - name: Machine
+        run: |
+          {
+            echo "cpus=$(nproc)"
+            echo "model=$(lscpu | sed -n 's/^Model name: *//p' | head -1)"
+            echo "memory_kb=$(sed -n 's/^MemTotal: *\([0-9]*\).*/\1/p' /proc/meminfo)"
+            echo "os=$(. /etc/os-release && echo "$PRETTY_NAME")"
+          } | tee machine.txt
+
+      - name: Clone Prometheus
+        run: |
+          start=$(date +%s.%N)
+          git init --quiet src
+          git -C src fetch --quiet --depth 1 https://github.com/prometheus/prometheus.git "$PROMETHEUS_SHA"
+          git -C src checkout --quiet --detach FETCH_HEAD
+          test "$(git -C src rev-parse HEAD)" = "$PROMETHEUS_SHA"
+          echo "clone_s=$(echo "$(date +%s.%N) - $start" | bc)" >> times.txt
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: false
+
+      - name: Download modules (network)
+        working-directory: src
+        run: |
+          start=$(date +%s.%N)
+          go mod download
+          echo "modules_s=$(echo "$(date +%s.%N) - $start" | bc)" >> ../times.txt
+
+      - name: Build (CPU)
+        working-directory: src
+        run: |
+          start=$(date +%s.%N)
+          go build -o /tmp/bin/ ./cmd/prometheus ./cmd/promtool
+          echo "build_s=$(echo "$(date +%s.%N) - $start" | bc)" >> ../times.txt
+
+      - name: Test TSDB (CPU)
+        working-directory: src
+        run: |
+          start=$(date +%s.%N)
+          go test -short -count=1 ./tsdb/... > ../test.log 2>&1 || echo "tests_failed=1" >> ../times.txt
+          echo "test_s=$(echo "$(date +%s.%N) - $start" | bc)" >> ../times.txt
+
+      - name: Result
+        run: |
+          python3 - <<'PY'
+          import json, os
+          kv = lambda f: dict(l.strip().split("=", 1) for l in open(f) if "=" in l)
+          m, t = kv("machine.txt"), kv("times.txt")
+          out = {"workload": "linux-prometheus", "label": os.environ["LABEL"], "run": int(os.environ["RUN"]),
+                 "machine": m, "times": {k: float(v) for k, v in t.items()}}
+          json.dump(out, open("result.json", "w"), indent=2)
+          print(json.dumps(out, indent=2))
+          PY
+        env:
+          LABEL: ${{ inputs.label || 'github-ubuntu-24.04' }}
+          RUN: ${{ matrix.run }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-linux-${{ inputs.label || 'github-ubuntu-24.04' }}-${{ matrix.run }}
+          path: result.json
+          retention-days: 30
